@@ -1,0 +1,10 @@
+pyyaml>=6
+platformdirs>=3
+nicegui>=2.0
+
+[dev]
+pytest
+ruff
+
+[native]
+nicegui[native]

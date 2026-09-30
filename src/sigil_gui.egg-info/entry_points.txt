@@ -1,0 +1,2 @@
+[console_scripts]
+sigil-gui = sigil_gui.__main__:main

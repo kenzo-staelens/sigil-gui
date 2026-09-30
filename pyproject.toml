@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sigil-gui"
+version = "0.1.0"
+description = "Local GUI for editing sigil-cli command trees"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["pyyaml>=6", "platformdirs>=3", "nicegui>=2.0", "sigil-cli"]
+
+[project.optional-dependencies]
+native = ["nicegui[native]"]   # open in a desktop window instead of a browser tab
+dev = ["pytest", "ruff"]
+
+[project.scripts]
+sigil-gui = "sigil_gui.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

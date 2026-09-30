@@ -14,6 +14,7 @@ from typing import Any
 from nicegui import ui
 
 from ..core import preview
+from ..core import scripts as sc
 from ..core.draft import Draft, DraftError
 from ..core.library import Library
 from ..core.model import Fragment
@@ -35,6 +36,8 @@ class Studio:
         self.selected: str | None = None
         self.draft: Draft | None = None
         self.subtree_mode = False
+        self.script_text: str | None = None      # edited script source (None = untouched)
+        self.script_ref: str | None = None       # the script ref that text belongs to
         self.ctx = SimpleNamespace(touch=self.touch, restructure=self._restructure)
         if project:
             try:
@@ -93,7 +96,7 @@ class Studio:
         """True when it is fine to replace the current view (no lost edits, or user agreed)."""
         if self.ws is None:
             return True
-        if self.draft and self.draft.dirty and not await confirm("Discard edits?", f"Unapplied edits will be lost if you {what}.", "Discard"):
+        if self.has_edits and not await confirm("Discard edits?", f"Unapplied edits will be lost if you {what}.", "Discard"):
             return False
         if self.ws.dirty and not await confirm("Unsaved changes", f"{self.ws.label} has unsaved changes. Discard them and {what}?", "Discard"):
             return False
@@ -150,7 +153,7 @@ class Studio:
     async def edit_fragment(self, name: str) -> None:
         if self.ws is not None and self.ws.kind == "fragment" and not await self._leave_ok("open another fragment"):
             return
-        if self.draft and self.draft.dirty and not await confirm("Discard edits?", "Unapplied edits will be lost.", "Discard"):
+        if self.has_edits and not await confirm("Discard edits?", "Unapplied edits will be lost.", "Discard"):
             return
         try:
             frag_ws = Workspace.open_fragment(self.lib.path(name))
@@ -215,7 +218,7 @@ class Studio:
             self._after_change(self.selected)
 
     def _draft_clean_or_warn(self) -> bool:
-        if self.draft and self.draft.dirty:
+        if self.has_edits:
             ui.notify("apply or discard the current edit first", type="warning")
             return False
         return True
@@ -273,7 +276,7 @@ class Studio:
             if self.selected and getattr(self, "tree", None):
                 self.tree.select(self.selected)     # ignore "deselect" clicks
             return
-        if self.draft and self.draft.dirty and not await confirm("Discard edits?", f"Unapplied changes to {self.draft.origin} will be lost.", "Discard"):
+        if self.has_edits and not await confirm("Discard edits?", f"Unapplied changes to {self.draft.origin} will be lost.", "Discard"):
             self.tree.select(self.selected)
             return
         self.selected = key
@@ -295,7 +298,7 @@ class Studio:
         self.touch()
 
     async def _mutate(self, fn: Any, select: str | None = None) -> None:
-        if self.draft and self.draft.dirty and not await confirm("Discard edits?", "Unapplied edits will be lost.", "Discard"):
+        if self.has_edits and not await confirm("Discard edits?", "Unapplied edits will be lost.", "Discard"):
             return
         try:
             result = fn()
@@ -369,7 +372,7 @@ class Studio:
         for e in entries:
             with ui.card().classes("w-full q-pa-sm"):
                 ui.label(e.name).classes("text-bold")
-                ui.label(f"{e.size} node(s)" + (f" · {e.description}" if e.description else "")).classes("text-caption")
+                ui.label(f"{e.size} node(s)" + (f", {e.scripts} script(s)" if e.scripts else "") + (f" · {e.description}" if e.description else "")).classes("text-caption")
                 with ui.row().classes("gap-1"):
                     ui.button("edit", icon="edit", on_click=lambda n=e.name: self.edit_fragment(n)).props("flat dense no-caps size=sm")
                     if can_insert:
@@ -384,7 +387,17 @@ class Studio:
             ui.notify(str(e), type="negative")
             return
         parent = self.selected
-        await self._mutate(lambda: self.ws.insert(frag, parent)[frag.root], parent)
+        policy = "keep"
+        conflicts = self.ws.script_conflicts(frag, parent)
+        if conflicts:
+            policy = await choose("Script files already exist", "Different content already exists for: " + ", ".join(conflicts),
+                                  {"keep": "Keep existing", "overwrite": "Overwrite"})
+            if policy is None:
+                return
+        report: list[str] = []
+        await self._mutate(lambda: self.ws.insert(frag, parent, scripts=policy, report=report)[frag.root], parent)
+        if report:
+            ui.notify("\n".join(report), type="warning", multi_line=True)
 
     async def delete_from_library(self, name: str) -> None:
         if await confirm("Delete from library?", name, "Delete"):
@@ -392,7 +405,16 @@ class Studio:
             self.library_view.refresh()
 
     # ------------------------------------------------------------------ inspector
+    @property
+    def has_edits(self) -> bool:
+        return bool(self.draft and self.draft.dirty) or self._script_dirty()
+
+    def _script_dirty(self) -> bool:
+        return self.script_text is not None and self.draft is not None and \
+            self.script_text != (self.ws.read_script(self._preview_nodes(), self.draft.root) or "")
+
     def _new_draft(self) -> None:
+        self.script_text = self.script_ref = None
         self.draft = self.ws.begin_edit(self.selected, self.subtree_mode) if self.ws and self.selected in (self.ws.index or {}) else None
 
     @ui.refreshable
@@ -409,14 +431,17 @@ class Studio:
                     ui.label(node.file).classes("text-caption")
                 ui.space()
                 ui.switch("edit whole subtree", value=self.subtree_mode, on_change=self._toggle_scope)
-            with ui.tabs().classes("w-full") as tabs:
-                t_form = ui.tab("Form")
-                t_yaml = ui.tab("YAML")
-            with ui.tab_panels(tabs, value=t_form).classes("w-full"):
-                with ui.tab_panel(t_form).classes("q-pa-xs"):
+            with ui.tabs(on_change=self._tab_changed).classes("w-full") as tabs:
+                ui.tab("form", label="Form")
+                ui.tab("yaml", label="YAML")
+                ui.tab("script", label="Script", icon="code")
+            with ui.tab_panels(tabs, value="form").classes("w-full"):
+                with ui.tab_panel("form").classes("q-pa-xs"):
                     self._form(d)
-                with ui.tab_panel(t_yaml).classes("q-pa-xs"):
-                    self._yaml_editor(d)
+                with ui.tab_panel("yaml").classes("q-pa-xs"):
+                    self.yaml_panel()
+                with ui.tab_panel("script").classes("q-pa-xs"):
+                    self.script_panel()
             with ui.row().classes("gap-2"):
                 self.b_apply = ui.button("Apply", icon="check", on_click=self.apply)
                 self.b_discard = ui.button("Discard", icon="close", on_click=self.discard).props("flat")
@@ -446,7 +471,7 @@ class Studio:
             ui.label(f"parent: {data.get('parent')}   (use “Move” in the tree to change)").classes("text-caption")
         with ui.row().classes("gap-4"):
             forms.switch_field(data, "default", "default subcommand", self.touch)
-            forms.switch_field(data, "known_args", "known_args (parse_args vs parse_known_args)", self.touch)
+            forms.switch_field(data, "known_args", "known_args (tolerate unknown flags)", self.touch)
             forms.switch_field(data, "load", "load", self.touch, default=True)
         ui.label("Arguments").classes("text-subtitle2 q-mt-sm")
         self.args_section()
@@ -461,13 +486,24 @@ class Studio:
         self.args_section.refresh()
         self.touch()
 
-    def _yaml_editor(self, d: Draft) -> None:
+    def _tab_changed(self, e: Any) -> None:
+        """Panels that mirror the draft are rebuilt when opened, so they never show stale content."""
+        if e.value == "yaml":
+            self.yaml_panel.refresh()
+        elif e.value == "script":
+            self.script_panel.refresh()
+
+    @ui.refreshable
+    def yaml_panel(self) -> None:
+        d = self.draft
+        if d is None:
+            return
         ui.label("Raw YAML of this draft — " + ("all nodes in the subtree." if d.subtree else "this node (add child nodes here too).")).classes("text-caption")
-        area = ui.codemirror(value=d.to_text(), language='YAML').props("outlined autogrow input-class=font-mono").classes("w-full")
+        editor = ui.codemirror(d.to_text(), language="YAML").classes("w-full").style("min-height: 22rem")
 
         def load() -> None:
             try:
-                d.replace_from_text(area.value or "")
+                d.replace_from_text(editor.value or "")
             except DraftError as e:
                 ui.notify(str(e), type="negative")
                 return
@@ -476,8 +512,49 @@ class Studio:
 
         ui.button("Update draft from YAML", on_click=load).props("flat no-caps")
 
+    @ui.refreshable
+    def script_panel(self) -> None:
+        d = self.draft
+        if d is None:
+            return
+        nodes, key = self._preview_nodes(), d.root
+        label, state = self.ws.script_info(nodes, key)
+        ref = sc.script_ref(nodes[key])
+        if self.script_ref != ref:                     # the `script` field changed: drop text of the old one
+            self.script_text, self.script_ref = None, ref
+        if state == "unset":
+            ui.label("This command has no `script`. Set one in the Form tab.").classes("text-caption")
+            return
+        if state == "unsupported":
+            ui.label(f"{label}: absolute script paths are not embedded in library fragments.").classes("text-caption")
+            return
+        if state == "no-dir":
+            ui.label(f"Cannot locate “{label}”: the root command has no `script_dir`.").classes("text-caption text-negative")
+            return
+        stored = self.ws.read_script(nodes, key)
+        text = self.script_text if self.script_text is not None else stored
+        ui.label(label).classes("text-caption")
+        if text is None:
+            ui.label("This script file does not exist yet.").classes("text-caption")
+
+            def create() -> None:
+                self.script_text = sc.TEMPLATE
+                self.script_panel.refresh()
+                self.touch()
+
+            ui.button("Create from template", icon="note_add", on_click=create).props("flat no-caps")
+            return
+        problem = ui.label(sc.check_source(text) or "✓ defines run(args, ctx)").classes("text-caption")
+
+        def changed(e: Any) -> None:
+            self.script_text = e.value
+            problem.set_text(sc.check_source(e.value or "") or "✓ defines run(args, ctx)")
+            self.touch()
+
+        ui.codemirror(text, language="Python", on_change=changed).classes("w-full").style("min-height: 24rem")
+
     async def _toggle_scope(self, e: Any) -> None:
-        if self.draft and self.draft.dirty and not await confirm("Discard edits?", "Switching scope restarts the draft.", "Discard"):
+        if self.has_edits and not await confirm("Discard edits?", "Switching scope restarts the draft.", "Discard"):
             self.inspector_view.refresh()
             return
         self.subtree_mode = bool(e.value)
@@ -489,12 +566,19 @@ class Studio:
         d = self.draft
         if not d:
             return
+        script = self.script_text if self._script_dirty() else None
         try:
-            self.ws.commit(d)
+            if d.dirty:
+                self.ws.commit(d)
+            if script is not None:
+                self.ws.write_script(self.ws.raw, d.root, script)   # after commit: `script` may have changed
         except (WorkspaceError, DraftError) as e:
             ui.notify(f"not applied: {e}", type="negative")
             return
-        ui.notify("applied", type="positive")
+        ui.notify("applied" + (" (script is written on Save)" if script is not None and self.ws.kind == "project" else ""),
+                  type="positive")
+        if script is not None and (problem := sc.check_source(script)):
+            ui.notify(f"script: {problem}", type="warning")
         self._after_change(d.root)
 
     def discard(self) -> None:
@@ -539,17 +623,17 @@ class Studio:
         self._render_issues()
 
     def _sync(self) -> None:
-        ws, d = self.ws, self.draft
+        ws = self.ws
         if getattr(self, "title", None) is None:
             return
         self.title.set_text((("Library ▸ " if ws.kind == "fragment" else "") + ws.label) if ws else "")
-        self.status.set_text(("● unsaved  " if ws and ws.dirty else "") + ("● draft edited" if d and d.dirty else ""))
+        self.status.set_text(("● unsaved  " if ws and ws.dirty else "") + ("● unapplied edits" if self.has_edits else ""))
         for btn, on in [(self.b_undo, bool(ws and ws.can_undo)), (self.b_redo, bool(ws and ws.can_redo)), (self.b_save, bool(ws and ws.dirty))]:
             btn.set_enabled(on)
         if getattr(self, "b_apply", None) is not None:
             try:
-                self.b_apply.set_enabled(bool(d and d.dirty))
-                self.b_discard.set_enabled(bool(d and d.dirty))
+                self.b_apply.set_enabled(self.has_edits)
+                self.b_discard.set_enabled(self.has_edits)
             except Exception:   # element belongs to a refreshed-away inspector
                 pass
 

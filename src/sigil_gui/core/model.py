@@ -45,12 +45,14 @@ class Fragment:
     """A self-contained subtree: ``nodes`` are deep copies, parents first.
 
     Serialised as an ordinary sigil YAML file with one extra top-level object
-    (``_fragment``, ``load: false``) so the file is still valid sigil config.
+    (``_fragment``, ``load: false``) so the file is still valid sigil config. Script sources
+    ride along in that object (``scripts: {ref: source}``).
     """
 
     root: str
     nodes: dict[str, Any] = field(default_factory=dict)
     meta: dict[str, Any] = field(default_factory=dict)
+    scripts: dict[str, str] = field(default_factory=dict)     # script ref -> python source
 
     META_KEY: ClassVar[str] = "_fragment"
 
@@ -60,8 +62,10 @@ class Fragment:
         meta["load"] = False
         meta["root"] = self.root
         for k, v in self.meta.items():
-            if k not in ("load", "root"):
+            if k not in ("load", "root", "scripts"):
                 meta[k] = v
+        if self.scripts:
+            meta["scripts"] = dict(self.scripts)
         doc[self.META_KEY] = meta
         for k, d in self.nodes.items():
             doc[k] = d
@@ -83,4 +87,7 @@ class Fragment:
             raise ValueError(f"nodes not reachable from root {root!r}: {extra}")
         meta.pop("load", None)
         meta.pop("root", None)
-        return cls(root=root, nodes=ordered, meta=meta)
+        raw_scripts = meta.pop("scripts", None)
+        scripts = {k: v for k, v in raw_scripts.items() if isinstance(k, str) and isinstance(v, str)} \
+            if isinstance(raw_scripts, Mapping) else {}
+        return cls(root=root, nodes=ordered, meta=meta, scripts=scripts)

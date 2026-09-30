@@ -20,6 +20,14 @@ class _Dumper(yaml.SafeDumper):
         return super().increase_indent(flow, False)   # indent list items under their key
 
 
+def _str_repr(dumper: yaml.Dumper, data: str) -> Any:
+    style = "|" if "\n" in data else None          # scripts embedded in fragments stay readable
+    return dumper.represent_scalar("tag:yaml.org,2002:str", data, style=style)
+
+
+_Dumper.add_representer(str, _str_repr)
+
+
 def loads(text: str) -> Any:
     return yaml.safe_load(text)
 

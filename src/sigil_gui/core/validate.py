@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from . import tree
+from . import scripts as sc
 from .model import ARG_KINDS
 
 # parser kwargs sigil drops with a warning (models/command.py: UNSUPPORTED_KWARGS)
@@ -25,19 +26,7 @@ class Issue:
 
 def resolve_script(ws: Any, key: str) -> Path | None:
     """Best-effort location of a node's script file, or None if not determinable."""
-    raw = {k: n.data for k, n in ws.index.items()}
-    script = raw[key].get("script")
-    if not isinstance(script, str) or not script:
-        return None
-    if Path(script).is_absolute():
-        return Path(script)
-    script_dir = raw[tree.root_of(raw, key)].get("script_dir")
-    if not isinstance(script_dir, str):
-        return None
-    base = ws.root / script_dir
-    flat = base / f"{script}.py"
-    nested = base / (script.replace(".", "/") + ".py")
-    return flat if flat.exists() or not nested.exists() else nested
+    return sc.script_path(ws.root, ws.raw, key)
 
 
 def _check_args(args: Any, key: str, trail: str, out: list[Issue]) -> None:

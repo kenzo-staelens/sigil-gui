@@ -8,7 +8,8 @@ version = "0.1.0"
 description = "Local GUI for editing sigil-cli command trees"
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = ["pyyaml>=6", "platformdirs>=3", "nicegui>=2.0", "sigil-cli"]
+# ui.codemirror needs a recent NiceGUI 2.x
+dependencies = ["pyyaml>=6", "platformdirs>=3", "nicegui>=2.5", "sigil-cli"]
 
 [project.optional-dependencies]
 native = ["nicegui[native]"]   # open in a desktop window instead of a browser tab

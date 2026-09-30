@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 from . import manifest as mf
+from . import scripts as sc
 from . import tree, yamlio
 from .draft import Draft
 from .model import Fragment, Node
@@ -60,6 +61,7 @@ class Workspace:
         self._undo: list[tuple[str, Any]] = []
         self._redo: list[tuple[str, Any]] = []
         self._depth = 0
+        self._scripts: dict[Path, str] = {}       # project: script edits not yet written to disk
 
     # -- construction ---------------------------------------------------------------
     @classmethod
@@ -205,11 +207,11 @@ class Workspace:
         return validate(self)
 
     # -- transactions / history -----------------------------------------------------
-    def _snapshot(self) -> tuple[Any, Any]:
-        return copy.deepcopy(self.manifest), copy.deepcopy(self.docs)
+    def _snapshot(self) -> tuple[Any, Any, Any]:
+        return copy.deepcopy(self.manifest), copy.deepcopy(self.docs), dict(self._scripts)
 
-    def _restore(self, snap: tuple[Any, Any]) -> None:
-        self.manifest, self.docs = snap
+    def _restore(self, snap: tuple[Any, Any, Any]) -> None:
+        self.manifest, self.docs, self._scripts = snap
         self._reindex()
 
     def _fatal(self) -> set[tuple[str, str | None, str]]:
@@ -341,15 +343,25 @@ class Workspace:
         return new_keys[key]
 
     # -- fragments ------------------------------------------------------------------
-    def extract(self, key: str, subtree: bool = True) -> Fragment:
+    def extract(self, key: str, subtree: bool = True, with_scripts: bool = True) -> Fragment:
         keys = self.subtree_keys(key) if subtree else [key]
         self.get(key)
-        return Fragment(key, {k: copy.deepcopy(self.index[k].data) for k in keys})
+        frag = Fragment(key, {k: copy.deepcopy(self.index[k].data) for k in keys})
+        if with_scripts:
+            for k in keys:
+                ref = sc.script_ref(frag.nodes[k])
+                if ref and not sc.is_absolute(ref) and ref not in frag.scripts:
+                    text = self.read_script(self.raw, k)
+                    if text is not None:
+                        frag.scripts[ref] = text
+        return frag
 
-    def insert(self, frag: Fragment, parent: str | None, prefix: str = "",
-               suffix: str = "") -> dict[str, str]:
+    def insert(self, frag: Fragment, parent: str | None, prefix: str = "", suffix: str = "",
+               scripts: str = "keep", report: list[str] | None = None) -> dict[str, str]:
         """Add a fragment under `parent`. Colliding keys get a numeric suffix.
 
+        Embedded scripts are installed under the target's ``script_dir``. ``scripts="keep"`` never
+        replaces an existing, different file; ``"overwrite"`` does. Notes go to `report`.
         Returns the old-key -> new-key mapping.
         """
         with self.transaction(f"insert {frag.root}"):
@@ -373,11 +385,110 @@ class Workspace:
                 elif d.get("parent") in mapping:
                     d["parent"] = mapping[d["parent"]]
                 self._put(mapping[k], d)
+            used = {sc.script_ref(d) for d in frag.nodes.values()}
+            for ref, text in frag.scripts.items():
+                if ref in used:
+                    self._install_script(ref, text, parent, scripts == "overwrite", report)
         return mapping
+
+    # -- scripts --------------------------------------------------------------------
+    def _frag_scripts(self) -> dict[str, str]:
+        doc = next(iter(self.docs.values()))
+        meta = doc.setdefault(Fragment.META_KEY, {"load": False})
+        scripts = meta.get("scripts")
+        if not isinstance(scripts, dict):
+            scripts = meta["scripts"] = {}
+        return scripts
+
+    def _current_text(self, path: Path) -> str | None:
+        if path in self._scripts:
+            return self._scripts[path]
+        return path.read_text(encoding="utf-8") if path.is_file() else None
+
+    def _script_target(self, ref: str, parent: str | None) -> Path | None:
+        if parent is None or sc.is_absolute(ref):
+            return None
+        base = sc.script_dir_for(self.root, self.raw, parent)
+        return sc.module_path(base, ref) if base else None
+
+    def _install_script(self, ref: str, text: str, parent: str | None, overwrite: bool,
+                        report: list[str] | None) -> None:
+        note = report.append if report is not None else (lambda _m: None)
+        if self.kind == "fragment":
+            store = self._frag_scripts()
+            if ref in store and store[ref] != text and not overwrite:
+                note(f"kept existing script {ref}")
+            else:
+                store[ref] = text
+            return
+        target = self._script_target(ref, parent)
+        if target is None:
+            note(f"script {ref!r} not installed: no script_dir above the insert point")
+            return
+        existing = self._current_text(target)
+        if existing is not None and existing != text and not overwrite:
+            note(f"kept existing {mf.rel_of(self.root, target)} (differs from the fragment's)")
+            return
+        self._scripts[target] = text
+
+    def script_conflicts(self, frag: Fragment, parent: str | None) -> list[str]:
+        """Refs whose target file already exists with different content."""
+        out = []
+        used = {sc.script_ref(d) for d in frag.nodes.values()}
+        for ref, text in frag.scripts.items():
+            if ref not in used:
+                continue
+            if self.kind == "fragment":
+                cur = self._frag_scripts().get(ref)
+            else:
+                target = self._script_target(ref, parent)
+                cur = self._current_text(target) if target else None
+            if cur is not None and cur != text:
+                out.append(ref)
+        return out
+
+    def script_info(self, nodes: Mapping[str, Any], key: str) -> tuple[str | None, str]:
+        """(location label, state) for the script of `key`; state in unset|unsupported|no-dir|missing|ok."""
+        ref = sc.script_ref(nodes.get(key))
+        if not ref:
+            return None, "unset"
+        if self.kind == "fragment":
+            if sc.is_absolute(ref):
+                return ref, "unsupported"
+            return f"{ref} (embedded)", "ok" if ref in self._frag_scripts() else "missing"
+        path = sc.script_path(self.root, nodes, key)
+        if path is None:
+            return ref, "no-dir"
+        label = mf.rel_of(self.root, path)
+        return label, "ok" if self._current_text(path) is not None else "missing"
+
+    def read_script(self, nodes: Mapping[str, Any], key: str) -> str | None:
+        ref = sc.script_ref(nodes.get(key))
+        if not ref:
+            return None
+        if self.kind == "fragment":
+            return self._frag_scripts().get(ref)
+        path = sc.script_path(self.root, nodes, key)
+        return self._current_text(path) if path else None
+
+    def write_script(self, nodes: Mapping[str, Any], key: str, text: str) -> None:
+        ref = sc.script_ref(nodes.get(key))
+        if not ref:
+            raise WorkspaceError("this command has no `script` set")
+        with self.transaction(f"edit script {ref}"):
+            if self.kind == "fragment":
+                if sc.is_absolute(ref):
+                    raise WorkspaceError("absolute script paths cannot be embedded in a fragment")
+                self._frag_scripts()[ref] = text
+            else:
+                path = sc.script_path(self.root, nodes, key)
+                if path is None:
+                    raise WorkspaceError("no script_dir on the root command, so the script location is unknown")
+                self._scripts[path] = text
 
     # -- drafts ---------------------------------------------------------------------
     def begin_edit(self, key: str, subtree: bool = False) -> Draft:
-        return Draft(origin=key, subtree=subtree, fragment=self.extract(key, subtree))
+        return Draft(origin=key, subtree=subtree, fragment=self.extract(key, subtree, with_scripts=False))
 
     def commit(self, draft: Draft) -> None:
         """Apply a draft atomically. Unchanged nodes are left untouched."""
@@ -408,6 +519,20 @@ class Workspace:
             tops = self.top_level()
             if len(tops) == 1:
                 meta["root"] = tops[0].key
+            used = {sc.script_ref(n.data) for n in self.index.values()}
+            store = meta.get("scripts")
+            if isinstance(store, dict):
+                for ref in [r for r in store if r not in used]:
+                    del store[ref]
+                if not store:
+                    del meta["scripts"]
+
+    @staticmethod
+    def _disk_text(path: Path) -> str | None:
+        try:
+            return path.read_text(encoding="utf-8")
+        except OSError:
+            return None
 
     def save(self) -> list[str]:
         """Write only files whose data changed; delete dropped files. Returns touched paths."""
@@ -429,6 +554,12 @@ class Workspace:
                 yamlio.write(self.root / rel, doc)
                 self._disk[rel] = copy.deepcopy(doc)
                 touched.append(rel)
+        for path, text in self._scripts.items():
+            if self._disk_text(path) != text:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(text, encoding="utf-8")
+                touched.append(mf.rel_of(self.root, path))
+        self._scripts.clear()
         if self.kind == "project" and self.manifest != self._manifest_disk:
             yamlio.write(self.root / self.manifest_name, self.manifest, "manifest")
             self._manifest_disk = list(self.manifest)

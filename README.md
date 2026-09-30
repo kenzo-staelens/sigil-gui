@@ -22,6 +22,7 @@ AI generated because i couldn't be arsed to write a management tool for sigil my
 | open / create projects | start page; **file browser** dialogs, recent projects remembered. *New project* asks for a parent folder + name and creates only that folder (`manifest.yml`, `yml/root.yml`, `scripts/`); it never writes to the launch directory |
 | compose commands | tree (left): add child, duplicate, move, delete; all undoable |
 | edit a node **or a whole subtree atomically** | inspector: edit a *draft*, then **Apply** (one transaction) or **Discard**. "edit whole subtree" makes the subtree the unit; the YAML tab edits the draft as text |
+| edit scripts | **Script** tab (CodeMirror, Python): edits the file behind the node's `script` (`<script_dir>/<script>.py`, `script_dir` relative to the manifest folder). "Create from template" writes the `run(args, ctx)` skeleton; a live check flags syntax errors / a missing `run`. Script edits go through the same Apply button and are written on Save |
 | repository of subcommands | **Library**, usable with no project open: create, edit, delete fragments on the start page. With a project open, "insert under selection" and "save subtree to library" |
 | live feedback | right pane: `--help` of the draft (built like sigil's `Builder`), its YAML, structural issues (click to jump) |
 
@@ -45,22 +46,17 @@ deletes the file.
 * **Transactions.** Every workspace mutation snapshots state, applies, re-validates and rolls back if it
   introduces a dangling parent, cycle or duplicate key. Snapshots are the undo history.
 * **Library fragments are valid sigil config**: a YAML file with the subtree plus one `_fragment` object
-  (`load: false`). Editing a fragment uses the same workspace/draft/undo machinery as a project.
-  Inserting auto-suffixes colliding keys. The library folder defaults to a per-user data dir
-  (`$SIGIL_GUI_LIBRARY` / `--library` / the in-app folder picker override it).
+  (`load: false`) that also embeds the scripts (`scripts: {ref: source}`, as YAML block scalars), so a fragment is a
+  single self-contained file. Editing a fragment uses the same workspace/draft/undo machinery as a project.
+  Inserting auto-suffixes colliding keys and installs the scripts under the target's `script_dir`; an existing
+  script with different content is never replaced silently (you choose keep / overwrite). Absolute `script` paths are
+  not embedded. Unused embedded scripts are pruned when a fragment is saved. The library folder defaults to a per-user data dir
+  (`$SIGIL_GUI_LIBRARY` / `--library` / the in-app folder picker override it). Needs a NiceGUI 2.x recent enough for `ui.codemirror`.
 * `core/` has no UI imports and is what the tests cover; `ui/` is a thin NiceGUI layer.
 * Help preview and validation follow `stages/builder.py` and `models/command.py`: `parser_kwargs` are the
   non-field keys, `dest`/`formatter_class`/`parents` are flagged as ignored, `required` only applies to
   option-style names, `load: false` commands are skipped, root requires a `name`. If `sigil` is
   importable, its `LibArgParser` is used for the preview.
-
-## Not done yet
-
-* Tree drag-and-drop (use "Move").
-* Library fragments do not carry their script files; they reference scripts by name only.
-* `type` values are resolved from Python builtins in the preview (as the sigil README documents); I have not
-  read `models/argument.py`, so custom type handling there is not mirrored.
-* Non-YAML datasources.
 
 ## Tests
 

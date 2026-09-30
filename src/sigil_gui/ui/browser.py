@@ -50,7 +50,7 @@ async def browse(title: str, start: str | Path | None = None, *, mode: str = "di
                         continue
                     if _is_dir(e):
                         try:
-                           icon = "token" if mode == "project" and (Path(e.path) / MANIFEST).is_file() else "folder"
+                            icon = "token" if mode == "project" and (Path(e.path) / MANIFEST).is_file() else "folder"
                         except PermissionError:
                             continue
                     elif e.name in {'manifest.yml', 'manifest.yaml'}:

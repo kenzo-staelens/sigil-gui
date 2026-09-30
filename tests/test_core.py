@@ -1,6 +1,6 @@
 import pytest
 
-from sigil_gui.core import preview, yamlio
+from sigil_gui.core import preview
 from sigil_gui.core.library import Library
 from sigil_gui.core.workspace import Workspace, WorkspaceError
 
@@ -219,3 +219,94 @@ def test_validation_new_rules(project):
     del ws.get("root").data["name"]
     codes = {i.code for i in ws.issues()}
     assert {"unsupported-kwarg", "missing-name"} <= codes
+
+
+# ---- scripts ---------------------------------------------------------------------
+def test_script_read_write_save_and_undo(project):
+    from sigil_gui.core import scripts as sc
+    ws = Workspace.open(project)
+    assert ws.script_info(ws.raw, "root_run") == ("scripts/run.py", "ok")
+    assert ws.read_script(ws.raw, "root_run").startswith("def run")
+    ws.write_script(ws.raw, "root_run", sc.TEMPLATE)
+    assert ws.dirty and ws.read_script(ws.raw, "root_run") == sc.TEMPLATE
+    assert (project / "scripts" / "run.py").read_text().startswith("def run")        # not on disk yet
+    ws.undo()
+    assert ws.read_script(ws.raw, "root_run").startswith("def run")
+    ws.redo()
+    assert "scripts/run.py" in ws.save()
+    assert (project / "scripts" / "run.py").read_text() == sc.TEMPLATE
+
+
+def test_script_state_variants(project):
+    ws = Workspace.open(project)
+    assert ws.script_info(ws.raw, "run_fast") == (None, "unset")
+    ws.get("run_fast").data["script"] = "sub.mod"
+    label, state = ws.script_info(ws.raw, "run_fast")
+    assert state == "missing" and label == "scripts/sub.mod.py"        # flat path until a nested file exists
+    ws.write_script(ws.raw, "run_fast", "def run(args, ctx): pass\n")
+    ws.save()
+    assert (project / "scripts" / "sub.mod.py").exists()
+    del ws.get("root").data["script_dir"]
+    assert ws.script_info(ws.raw, "run_fast")[1] == "no-dir"
+
+
+def test_fragments_carry_scripts(project, tmp_path):
+    ws = Workspace.open(project)
+    frag = ws.extract("root_run")
+    assert frag.scripts == {"run": (project / "scripts" / "run.py").read_text()}
+    lib = Library(tmp_path / "lib")
+    lib.save("runner", frag)
+    assert "scripts:" in lib.path("runner").read_text() and "|" in lib.path("runner").read_text()
+    assert [e.scripts for e in lib.list()] == [1]
+
+    other = Workspace.create(tmp_path / "other", "o")
+    loaded = lib.load("runner")
+    assert loaded.scripts == frag.scripts                              # YAML round trip is exact
+    report = []
+    other.insert(loaded, "root", report=report)
+    assert report == []
+    other.save()
+    assert (tmp_path / "other" / "scripts" / "run.py").read_text() == frag.scripts["run"]
+
+
+def test_insert_never_clobbers_unless_asked(project, tmp_path):
+    ws = Workspace.open(project)
+    frag = ws.extract("root_run")
+    frag.scripts["run"] = "def run(args, ctx):\n    print('new')\n"
+    assert ws.script_conflicts(frag, "root") == ["run"]
+    report = []
+    ws.insert(frag, "root", report=report)
+    assert report and "kept existing" in report[0]
+    assert ws.read_script(ws.raw, "root_run").startswith("def run(args, ctx): pass")
+    ws.insert(frag, "root", scripts="overwrite")
+    assert "print('new')" in ws.read_script(ws.raw, "root_run")
+
+
+def test_insert_without_script_dir_reports(project, tmp_path):
+    ws = Workspace.open(project)
+    frag = ws.extract("root_run")
+    report = []
+    ws.insert(frag, None, report=report)          # would become a second root; script has nowhere to go
+    assert any("no script_dir" in r for r in report)
+
+
+def test_fragment_workspace_edits_scripts(project, tmp_path):
+    ws = Workspace.open(project)
+    lib = Library(tmp_path / "lib")
+    lib.save("runner", ws.extract("root_run"))
+    fw = Workspace.open_fragment(lib.path("runner"))
+    assert fw.script_info(fw.raw, "root_run") == ("run (embedded)", "ok")
+    fw.write_script(fw.raw, "root_run", "def run(args, ctx):\n    return None\n")
+    fw.get("run_fast").data["script"] = "fast"
+    fw.write_script(fw.raw, "run_fast", "def run(args, ctx): pass\n")
+    fw.get("run_fast").data.pop("script")                 # unused script is pruned on save
+    fw.save()
+    frag = lib.load("runner")
+    assert set(frag.scripts) == {"run"} and "return None" in frag.scripts["run"]
+
+
+def test_check_source():
+    from sigil_gui.core import scripts as sc
+    assert sc.check_source(sc.TEMPLATE) is None
+    assert "syntax error" in sc.check_source("def run(:\n")
+    assert "no top-level run" in sc.check_source("x = 1\n")

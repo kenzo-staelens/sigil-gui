@@ -32,6 +32,7 @@ class Entry:
     description: str
     tags: tuple[str, ...]
     size: int              # number of nodes in the fragment
+    scripts: int = 0       # embedded script files
 
 
 def _slug(name: str) -> str:
@@ -53,7 +54,7 @@ class Library:
             except Exception:
                 continue            # not a fragment; ignore rather than crash the UI
             out.append(Entry(p.stem, p, str(frag.meta.get("description", "")),
-                             tuple(frag.meta.get("tags", []) or []), len(frag.nodes)))
+                             tuple(frag.meta.get("tags", []) or []), len(frag.nodes), len(frag.scripts)))
         return out
 
     def path(self, name: str) -> Path:
@@ -70,7 +71,8 @@ class Library:
         nodes = {k: dict(d) for k, d in frag.nodes.items()}
         nodes[frag.root].pop("parent", None)          # a fragment root is parentless by definition
         frag = Fragment(frag.root, nodes,
-                        {**frag.meta, "description": description, "tags": list(tags or [])})
+                        {**frag.meta, "description": description, "tags": list(tags or [])},
+                        dict(frag.scripts))
         path.parent.mkdir(parents=True, exist_ok=True)
         yamlio.write(path, frag.to_doc())
         return path
